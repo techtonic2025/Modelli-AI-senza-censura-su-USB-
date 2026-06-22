@@ -4,9 +4,6 @@
 
 Con un'architettura unificata, puoi inizializzare i tuoi modelli AI una volta sola e portarli con te su Windows, macOS e Linux.
 
-🎥 **Guarda il video di Setup & Demo:** [https://youtu.be/60PSXsoXc8A](https://youtu.be/60PSXsoXc8A)
-
-[![USB-Uncensored-LLM Setup & Demo](https://img.youtube.com/vi/60PSXsoXc8A/maxresdefault.jpg)](https://youtu.be/60PSXsoXc8A)
 
 ## 🚀 Caratteristiche Principali
 * **Zero Dipendenze:** Include Python portatile e binari del motore isolati. Nessun permesso di sistema, modifica al registro o gestori di pacchetti richiesti.
