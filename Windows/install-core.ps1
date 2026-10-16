@@ -460,6 +460,7 @@ Write-Host "[7/7] Importing AI models into the Ollama engine..." -ForegroundColo
 if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
     Write-Host "      ERROR: Ollama not found! Cannot import models." -ForegroundColor Red
     Write-Host "      Please re-run the installer to download Ollama." -ForegroundColor Red
+    $downloadErrors += "Ollama Engine / model import"
 } else {
     $env:OLLAMA_MODELS = "$USB_Drive\Shared\models\ollama_data"
     New-Item -ItemType Directory -Force -Path $env:OLLAMA_MODELS | Out-Null
@@ -477,6 +478,7 @@ if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
             $modelsToImport += $m
         } else {
             Write-Host "      Skipping $($m.Name) - GGUF file not found (download may have failed)" -ForegroundColor Red
+            $downloadErrors += "$($m.Name) / model file missing"
         }
     }
 
@@ -500,6 +502,7 @@ if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
 
         if (-Not $ready) {
             Write-Host "      ERROR: Ollama did not become ready in 60 seconds. Skipping import." -ForegroundColor Red
+            $downloadErrors += "Ollama Engine / startup timeout"
         }
 
         if ($ready) {
@@ -513,6 +516,7 @@ if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
                 } else {
                     Write-Host "      ERROR: Failed to import $($m.Name) (exit $LASTEXITCODE)" -ForegroundColor Red
                     Write-Host "      $createOutput" -ForegroundColor Red
+                    $downloadErrors += "$($m.Name) / import"
                 }
             }
         }
@@ -521,7 +525,8 @@ if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
         Stop-Process -Name "ollama-windows" -Force -ErrorAction SilentlyContinue
         Stop-Process -Name "ollama" -Force -ErrorAction SilentlyContinue
     } else {
-        Write-Host "      No models to import!" -ForegroundColor Yellow
+        Write-Host "      ERROR: No models to import!" -ForegroundColor Red
+        $downloadErrors += "Model import / no usable model file"
     }
 }
 
@@ -534,7 +539,7 @@ Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 if ($downloadErrors.Count -gt 0) {
-    Write-Host "   SETUP COMPLETE (with some errors)                      " -ForegroundColor Yellow
+    Write-Host "   SETUP NOT COMPLETE                                     " -ForegroundColor Red
     Write-Host "==========================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  The following had issues:" -ForegroundColor Red
@@ -542,13 +547,15 @@ if ($downloadErrors.Count -gt 0) {
         Write-Host "    ! $err" -ForegroundColor Red
     }
     Write-Host ""
-    Write-Host "  You can re-run install.bat to retry failed downloads." -ForegroundColor Yellow
+    Write-Host "  Do not start Fast Chat yet: no usable model is guaranteed." -ForegroundColor Yellow
+    Write-Host "  Re-run install.bat to retry failed downloads; completed files are skipped." -ForegroundColor Yellow
 } else {
     Write-Host "   SETUP COMPLETE! YOUR PORTABLE AI IS READY!             " -ForegroundColor Green
     Write-Host "==========================================================" -ForegroundColor Cyan
 }
 
 Write-Host ""
+if ($downloadErrors.Count -eq 0) {
 Write-Host "  Installed models:" -ForegroundColor White
 foreach ($m in $SelectedModels) {
     if ($m.Label -eq "UNCENSORED") {
@@ -568,6 +575,9 @@ foreach ($m in $SelectedModels) {
 Write-Host ""
 Write-Host "  To start your AI: Double-click  Windows\start-fast-chat.bat" -ForegroundColor White
 Write-Host "  On a Mac/Linux:   Run  start-fast-chat.sh from their folders" -ForegroundColor White
+}
 Write-Host ""
 Write-Host "Press any key to close this installer..." -ForegroundColor Yellow
 $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
+if ($downloadErrors.Count -gt 0) { exit 1 }
+exit 0
