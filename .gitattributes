@@ -1,0 +1,9 @@
+# Windows scripts need CRLF: cmd.exe can miss goto/call labels in LF-only
+# .bat files. Also applied to GitHub "Download ZIP" archives.
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# Unix scripts must stay LF or bash fails with "\r: command not found"
+*.sh      text eol=lf
+*.command text eol=lf
