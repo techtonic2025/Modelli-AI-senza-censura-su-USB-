@@ -6,7 +6,26 @@
 # ================================================================
 
 $ErrorActionPreference = "Continue"
-$USB_Drive = (Get-Item $MyInvocation.MyCommand.Path).Directory.Parent.FullName
+$USB_Drive = (Get-Item $MyInvocation.MyCommand.Path).Directory.Parent.FullName.TrimEnd('\')
+
+# -----------------------------------------------------------------
+# PRE-FLIGHT: Ollama needs 64-bit Windows 10/11 (PowerShell 5+)
+# -----------------------------------------------------------------
+if ($PSVersionTable.PSVersion.Major -lt 5 -or [Environment]::OSVersion.Version.Major -lt 10 -or -Not [Environment]::Is64BitOperatingSystem) {
+    Write-Host "ERROR: This installer needs 64-bit Windows 10 or 11." -ForegroundColor Red
+    Write-Host "       Windows 7/8 and 32-bit systems are not supported by the Ollama engine." -ForegroundColor Red
+    exit 1
+}
+
+# The portable engine uses its own port so it never collides with a
+# system-wide Ollama install (which would steal the model import).
+$PortableOllamaHost = "127.0.0.1:11435"
+
+# Keep the PC awake while downloading/importing (reset when this process exits)
+try {
+    Add-Type -Namespace PortableAI -Name Power -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
+    [PortableAI.Power]::SetThreadExecutionState([uint32]"0x80000001") | Out-Null
+} catch {}
 
 # -----------------------------------------------------------------
 # MODEL CATALOG (shared JSON config)
@@ -61,6 +80,159 @@ function Test-DownloadedFile {
     if (-Not (Test-Path $Path)) { return $false }
     $fileSize = (Get-Item $Path).Length
     return $fileSize -gt $MinSize
+}
+
+# -----------------------------------------------------------------
+# HELPER: File system of the USB drive (FAT32 cannot hold files > 4 GB)
+# -----------------------------------------------------------------
+function Get-USBFileSystem {
+    try {
+        return ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($USB_Drive))).DriveFormat
+    } catch {}
+    return ""
+}
+
+# -----------------------------------------------------------------
+# HELPER: Download with resume + retry. Returns $true on success.
+# -----------------------------------------------------------------
+function Invoke-Download {
+    param([string]$Url, [string]$Dest, [long]$MinSize, [int]$Attempts = 3)
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Host "      Retry attempt $attempt of $Attempts (resuming)..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 3
+        }
+        # -C - resumes a partial file instead of restarting from zero
+        curl.exe -L --fail --ssl-no-revoke --connect-timeout 30 --progress-bar -C - $Url -o $Dest
+        $rc = $LASTEXITCODE
+
+        if (Test-DownloadedFile -Path $Dest -MinSize $MinSize) { return $true }
+
+        if ($rc -eq 23) {
+            Write-Host "      ERROR: Cannot write to the drive (disk full, write-protected or FAT32 4 GB limit)." -ForegroundColor Red
+            return $false
+        }
+        if ($rc -eq 33) {
+            # Server refused to resume: restart clean
+            Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "      Download interrupted (curl exit $rc)." -ForegroundColor Red
+    }
+    return $false
+}
+
+# -----------------------------------------------------------------
+# HELPER: Write a Modelfile as UTF-8 *without* BOM (Ollama rejects BOM)
+# -----------------------------------------------------------------
+function Write-Modelfile {
+    param([string]$Path, $Model)
+    $prompt = ([string]$Model.Prompt) -replace '"""', '"'
+    $content = "FROM ./$($Model.File)`nPARAMETER temperature 0.7`nPARAMETER top_p 0.9`nSYSTEM `"`"`"$prompt`"`"`"`n"
+    [System.IO.File]::WriteAllText($Path, $content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# -----------------------------------------------------------------
+# ENGINE MODEL STORE
+# Models are imported WITHOUT copying: the .gguf is moved (an instant
+# rename on the same drive) into the engine's blob store and registered
+# through the API. This halves the space used and skips the slow copy.
+# -----------------------------------------------------------------
+$OllamaDataDir = "$USB_Drive\Shared\models\ollama_data"
+$OllamaBlobsDir = "$OllamaDataDir\blobs"
+
+function Test-ModelImported {
+    param([string]$Local)
+    # Ollama 0.40+ stores manifests in manifests-v2\ollama.com, older builds in manifests\registry.ollama.ai
+    return (Test-Path "$OllamaDataDir\manifests-v2\ollama.com\library\$Local\latest") -or
+           (Test-Path "$OllamaDataDir\manifests\registry.ollama.ai\library\$Local\latest")
+}
+
+# SHA256 of a file with a progress line (Get-FileHash shows nothing for minutes)
+function Get-FileSha256 {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $buffer = New-Object byte[] (8MB)
+        $total = $stream.Length
+        $done = 0L
+        $lastPct = -1
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $sha.TransformBlock($buffer, 0, $read, $null, 0) | Out-Null
+            $done += $read
+            $pct = [int](100 * $done / [math]::Max($total, 1))
+            if ($pct -ne $lastPct) {
+                Write-Host -NoNewline "`r      Checking model file... $pct% "
+                $lastPct = $pct
+            }
+        }
+        $sha.TransformFinalBlock($buffer, 0, 0) | Out-Null
+        Write-Host ""
+        return ([System.BitConverter]::ToString($sha.Hash) -replace '-', '').ToLower()
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+# If a previous run was closed between "move into engine" and "register",
+# put the .gguf back where it was so nothing has to be downloaded again.
+function Restore-InterruptedImport {
+    param($Model)
+    $gguf = "$USB_Drive\Shared\models\$($Model.File)"
+    $marker = "$gguf.importing"
+    if (-Not (Test-Path $marker)) { return }
+    $digest = (Get-Content -Raw $marker).Trim()
+    $blob = "$OllamaBlobsDir\sha256-$digest"
+    if (-Not (Test-Path $gguf) -and (Test-Path $blob) -and -Not (Test-ModelImported $Model.Local)) {
+        Move-Item -LiteralPath $blob -Destination $gguf -Force -ErrorAction SilentlyContinue
+        Write-Host "      Recovered $($Model.File) from an interrupted import." -ForegroundColor DarkGray
+    }
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+}
+
+# Registers one model in the running engine. Returns $true on success.
+function Import-ModelNoCopy {
+    param($Model)
+    $gguf = "$USB_Drive\Shared\models\$($Model.File)"
+    $marker = "$gguf.importing"
+
+    $digest = Get-FileSha256 -Path $gguf
+    $blob = "$OllamaBlobsDir\sha256-$digest"
+    New-Item -ItemType Directory -Force -Path $OllamaBlobsDir | Out-Null
+
+    $moved = $false
+    if (-Not (Test-Path $blob)) {
+        Set-Content -LiteralPath $marker -Value $digest -Encoding ASCII
+        Move-Item -LiteralPath $gguf -Destination $blob -Force -ErrorAction Stop
+        $moved = $true
+    }
+
+    $files = @{}
+    $files[$Model.File] = "sha256:$digest"
+    $body = @{
+        model      = $Model.Local
+        files      = $files
+        system     = [string]$Model.Prompt
+        parameters = @{ temperature = 0.7; top_p = 0.9 }
+        stream     = $false
+    } | ConvertTo-Json -Depth 4
+
+    try {
+        $r = Invoke-RestMethod -Uri "http://$PortableOllamaHost/api/create" -Method Post `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "application/json; charset=utf-8" -TimeoutSec 1800
+        if ($r.status -ne "success") { throw "engine answered: $($r.status)" }
+    } catch {
+        Write-Host "      ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        if ($moved) { Move-Item -LiteralPath $blob -Destination $gguf -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    # Same model already in the store under another name: the .gguf is a duplicate
+    if (-Not $moved) { Remove-Item -LiteralPath $gguf -Force -ErrorAction SilentlyContinue }
+    return $true
 }
 
 # ================================================================
@@ -232,20 +404,45 @@ if ($SelectedModels.Count -eq 0) {
 }
 
 # -----------------------------------------------------------------
-# USB space warning (if selecting 3+ models or all)
+# FAT32 check: files larger than 4 GB cannot be stored at all
+# -----------------------------------------------------------------
+$fileSystem = Get-USBFileSystem
+if ($fileSystem -eq "FAT32" -or $fileSystem -eq "FAT") {
+    $tooBig = @($SelectedModels | Where-Object { $_.Size -ne "?" -and [double]$_.Size -ge 4.0 })
+    if ($tooBig.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  =============================================" -ForegroundColor Red
+        Write-Host "  This drive is formatted as $($fileSystem): it cannot store files bigger than 4 GB." -ForegroundColor Red
+        foreach ($m in $tooBig) {
+            Write-Host "    - Skipping $($m.Name) (~$($m.Size) GB)" -ForegroundColor Red
+        }
+        Write-Host "  To use these models, back up the drive and format it as exFAT or NTFS." -ForegroundColor Yellow
+        Write-Host "  =============================================" -ForegroundColor Red
+        $SelectedModels = @($SelectedModels | Where-Object { $tooBig -notcontains $_ })
+        if ($SelectedModels.Count -eq 0) {
+            Write-Host ""
+            Write-Host "  No selected model fits on a $fileSystem drive. Pick model 1 or 6, or reformat." -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
+# -----------------------------------------------------------------
+# Space check: models are stored once; the engine needs ~5 GB while
+# it is being unpacked (zip + extracted files).
 # -----------------------------------------------------------------
 $totalSizeGB = 0
 foreach ($m in $SelectedModels) {
-    if ($m.Size -ne "?") { $totalSizeGB += [double]$m.Size }
+    if ($m.Size -ne "?" -and -Not (Test-ModelImported $m.Local)) { $totalSizeGB += [double]$m.Size }
 }
+$neededGB = [math]::Ceiling($totalSizeGB + 5)
 
-if ($SelectedModels.Count -ge 3 -or $UserChoice.Trim().ToLower() -eq "all") {
+if ($SelectedModels.Count -ge 3 -or $UserChoice.Trim().ToLower() -eq "all" -or ($freeGB -gt 0 -and $freeGB -lt $neededGB)) {
     Write-Host ""
     Write-Host "  =============================================" -ForegroundColor Red
-    Write-Host "  WARNING: You selected $($SelectedModels.Count) models!" -ForegroundColor Red
+    Write-Host "  WARNING: You selected $($SelectedModels.Count) model(s)!" -ForegroundColor Red
     Write-Host "  Estimated download: ~$totalSizeGB GB" -ForegroundColor Red
-    $neededGB = [math]::Ceiling($totalSizeGB + 4)
-    Write-Host "  USB drive needs at least ~$neededGB GB free!" -ForegroundColor Red
+    Write-Host "  Drive needs up to ~$neededGB GB free (models + AI engine)." -ForegroundColor Red
 
     if ($freeGB -gt 0 -and $freeGB -lt $neededGB) {
         Write-Host ""
@@ -260,7 +457,7 @@ if ($SelectedModels.Count -ge 3 -or $UserChoice.Trim().ToLower() -eq "all") {
         Write-Host ""
         Write-Host "Press any key to exit..." -ForegroundColor Yellow
         $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-        exit
+        exit 1
     }
 }
 
@@ -315,6 +512,13 @@ foreach ($m in $SelectedModels) {
     Write-Host ""
     Write-Host "  ($modelIndex/$($SelectedModels.Count)) $($m.Name) $sizeInfo" -ForegroundColor Yellow
 
+    # Already inside the engine: the .gguf was moved there, nothing to download
+    if (Test-ModelImported $m.Local) {
+        Write-Host "      Already installed in the AI engine! Skipping..." -ForegroundColor Green
+        continue
+    }
+    Restore-InterruptedImport -Model $m
+
     # Check if already downloaded
     if (Test-DownloadedFile -Path $dest -MinSize $m.MinBytes) {
         Write-Host "      Already downloaded! Skipping..." -ForegroundColor Green
@@ -333,22 +537,14 @@ foreach ($m in $SelectedModels) {
 
     Write-Host "      Downloading... This may take a while. Do NOT close this window!" -ForegroundColor Magenta
 
-    # Download with retry (up to 2 attempts)
-    $success = $false
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        if ($attempt -gt 1) {
-            Write-Host "      Retry attempt $attempt..." -ForegroundColor Yellow
-        }
+    if (Test-Path $dest) {
+        Write-Host "      Found a partial download - resuming where it stopped." -ForegroundColor DarkGray
+    }
 
-        curl.exe -L --ssl-no-revoke --progress-bar $m.URL -o $dest
-
-        if (Test-DownloadedFile -Path $dest -MinSize $m.MinBytes) {
-            $success = $true
-            break
-        } elseif (Test-Path $dest) {
-            $actualSize = [math]::Round((Get-Item $dest).Length / 1GB, 2)
-            Write-Host "      File seems too small ($actualSize GB). May be incomplete." -ForegroundColor Red
-        }
+    $success = Invoke-Download -Url $m.URL -Dest $dest -MinSize $m.MinBytes
+    if (-Not $success -and (Test-Path $dest)) {
+        $actualSize = [math]::Round((Get-Item $dest).Length / 1GB, 2)
+        Write-Host "      File is incomplete ($actualSize GB). Re-run install.bat to resume." -ForegroundColor Red
     }
 
     if ($success) {
@@ -370,25 +566,13 @@ Write-Host "[5/7] Creating AI model configurations..." -ForegroundColor Yellow
 
 foreach ($m in $SelectedModels) {
     $modelfilePath = "$USB_Drive\Shared\models\Modelfile-$($m.Local)"
-    $modelfileContent = @"
-FROM ./$($m.File)
-PARAMETER temperature 0.7
-PARAMETER top_p 0.9
-SYSTEM $($m.Prompt)
-"@
-    Set-Content -Path $modelfilePath -Value $modelfileContent -Force -Encoding UTF8
+    Write-Modelfile -Path $modelfilePath -Model $m
     Write-Host "      Config: $($m.Name) -> $($m.Local)" -ForegroundColor Green
 }
 
 # Also create a legacy "Modelfile" pointing to the first selected model (backward compat)
 $firstModel = $SelectedModels[0]
-$legacyModelfile = @"
-FROM ./$($firstModel.File)
-PARAMETER temperature 0.7
-PARAMETER top_p 0.9
-SYSTEM $($firstModel.Prompt)
-"@
-Set-Content -Path "$USB_Drive\Shared\models\Modelfile" -Value $legacyModelfile -Force -Encoding UTF8
+Write-Modelfile -Path "$USB_Drive\Shared\models\Modelfile" -Model $firstModel
 
 # Save installed models list for reference
 $installedList = $SelectedModels | ForEach-Object { "$($_.Local)|$($_.Name)|$($_.Label)" }
@@ -400,52 +584,93 @@ Write-Host "      Saved model list to installed-models.txt" -ForegroundColor Dar
 # =================================================================
 Write-Host ""
 Write-Host "[6/7] Downloading Ollama AI Engine (Windows)..." -ForegroundColor Yellow
+$BinDir     = "$USB_Drive\Shared\bin"
 $OllamaURL  = "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip"
-$OllamaDest = "$USB_Drive\Shared\bin\ollama-windows-amd64.zip"
-$TempOllamaDir = "$USB_Drive\Shared\bin\temp_ollama"
-$OllamaExe = "$USB_Drive\Shared\bin\ollama-windows.exe"
-$LlamaServerExe = "$USB_Drive\Shared\bin\llama-server.exe"
+$OllamaDest = "$BinDir\ollama-windows-amd64.zip"
+$TempOllamaDir = "$BinDir\temp_ollama"
+$OllamaExe = "$BinDir\ollama-windows.exe"
+# Ollama looks for its runtime in <exe folder>\lib\ollama: the folder layout
+# of the zip must be kept (cuda_v12 / cuda_v13 / vulkan share DLL names).
+$OllamaLibDir   = "$BinDir\lib\ollama"
+$LlamaServerExe = "$OllamaLibDir\llama-server.exe"
 
-if ((Test-Path $OllamaExe) -and (Test-Path $LlamaServerExe)) {
+function Test-OllamaRuntime {
+    return (Test-Path $OllamaExe) -and (Test-Path $LlamaServerExe) -and (Test-Path "$OllamaLibDir\ggml-base.dll")
+}
+
+# Runs "ollama -v" to catch a corrupted binary (e.g. "Go runtime crash")
+function Test-OllamaBinary {
+    try {
+        $p = Start-Process -FilePath $OllamaExe -ArgumentList "-v" -WindowStyle Hidden -PassThru
+        if (-Not $p.WaitForExit(30000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        return $p.ExitCode -eq 0
+    } catch {
+        return $false
+    }
+}
+
+# Older installers flattened every file of the zip into Shared\bin. Those
+# stray DLLs sit next to the exe and get loaded first, mixing versions.
+function Remove-OldWindowsRuntime {
+    Get-ChildItem -Path $BinDir -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -eq ".dll" -or $_.Name -like "llama-*.exe" -or $_.Name -like "*_LICENSE" -or
+        $_.Name -eq "ollama.exe" -or $_.Name -eq "ollama-windows.exe"
+    } | Remove-Item -Force -ErrorAction SilentlyContinue
+    Remove-Item "$BinDir\lib" -Force -Recurse -ErrorAction SilentlyContinue
+    Remove-Item $TempOllamaDir -Force -Recurse -ErrorAction SilentlyContinue
+}
+
+if (Test-OllamaRuntime) {
     Write-Host "      Ollama already installed! Skipping..." -ForegroundColor Green
 } else {
-    if ((Test-Path $OllamaExe) -and (-Not (Test-Path $LlamaServerExe))) {
-        Write-Host "      Existing Ollama install is incomplete. Re-downloading full runtime..." -ForegroundColor Yellow
+    if (Test-Path $OllamaExe) {
+        Write-Host "      Existing Ollama install is incomplete or outdated. Re-installing full runtime..." -ForegroundColor Yellow
     }
-    curl.exe -L --ssl-no-revoke --progress-bar $OllamaURL -o $OllamaDest
+    Stop-Process -Name "ollama-windows" -Force -ErrorAction SilentlyContinue
+    Remove-OldWindowsRuntime
 
-    if (Test-Path $OllamaDest) {
-        Write-Host "      Extracting Ollama..." -ForegroundColor Yellow
+    Write-Host "      The engine is a ~1.6 GB download. Do NOT close this window!" -ForegroundColor Magenta
+    if (-Not (Invoke-Download -Url $OllamaURL -Dest $OllamaDest -MinSize 200000000)) {
+        Write-Host "      ERROR: Ollama download failed!" -ForegroundColor Red
+        $downloadErrors += "Ollama Engine / download"
+    } else {
+        Write-Host "      Extracting Ollama (can take a few minutes on a USB drive)..." -ForegroundColor Yellow
         try {
-            Remove-Item $TempOllamaDir -Force -Recurse -ErrorAction SilentlyContinue
             New-Item -ItemType Directory -Force -Path $TempOllamaDir | Out-Null
-            Expand-Archive -Path $OllamaDest -DestinationPath $TempOllamaDir -Force
-
-            Get-ChildItem -Path $TempOllamaDir -Recurse -File | ForEach-Object {
-                $dest = Join-Path "$USB_Drive\Shared\bin" $_.Name
-                Move-Item -Path $_.FullName -Destination $dest -Force
-                Write-Host "      Extracted: $($_.Name)" -ForegroundColor DarkGray
+            # tar.exe ships with Windows 10+ and is far faster than Expand-Archive
+            $tarExe = "$env:SystemRoot\System32\tar.exe"
+            if (Test-Path $tarExe) {
+                # -m: don't restore file dates (fails on exFAT/FAT32 USB drives).
+                # A non-zero exit is only a warning here: the checks below decide.
+                & $tarExe -xmf $OllamaDest -C $TempOllamaDir
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "      tar.exe reported warnings (exit $LASTEXITCODE) - verifying files..." -ForegroundColor DarkGray
+                }
+            } else {
+                Expand-Archive -Path $OllamaDest -DestinationPath $TempOllamaDir -Force -ErrorAction Stop
             }
 
-            if (Test-Path "$USB_Drive\Shared\bin\ollama.exe") {
-                Move-Item -Path "$USB_Drive\Shared\bin\ollama.exe" -Destination $OllamaExe -Force
-            }
+            if (-Not (Test-Path "$TempOllamaDir\ollama.exe")) { throw "ollama.exe missing from the archive" }
+            Move-Item -Path "$TempOllamaDir\ollama.exe" -Destination $OllamaExe -Force -ErrorAction Stop
+            Move-Item -Path "$TempOllamaDir\lib" -Destination "$BinDir\lib" -Force -ErrorAction Stop
 
-            if (-Not (Test-Path $LlamaServerExe)) {
-                throw "llama-server.exe was not found after extraction"
-            }
+            if (-Not (Test-OllamaRuntime)) { throw "runtime files missing after extraction" }
+            if (-Not (Test-OllamaBinary)) { throw "ollama-windows.exe does not start (file corrupted - the drive may be faulty)" }
 
-            # Cleanup
             Remove-Item $TempOllamaDir -Force -Recurse -ErrorAction SilentlyContinue
             Remove-Item $OllamaDest -Force -ErrorAction SilentlyContinue
             Write-Host "      Ollama Setup Complete!" -ForegroundColor Green
         } catch {
-            Write-Host "      ERROR: Failed to extract Ollama. Please extract manually." -ForegroundColor Red
-            Write-Host "      File: $OllamaDest" -ForegroundColor DarkGray
+            Write-Host "      ERROR: Failed to install Ollama: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "      Re-run install.bat to try again." -ForegroundColor DarkGray
+            # Remove the half-installed runtime and the (possibly corrupt) zip
+            Remove-OldWindowsRuntime
+            Remove-Item $OllamaDest -Force -ErrorAction SilentlyContinue
+            $downloadErrors += "Ollama Engine / extraction"
         }
-    } else {
-        Write-Host "      ERROR: Ollama download failed!" -ForegroundColor Red
-        $downloadErrors += "Ollama Engine"
     }
 }
 
@@ -457,40 +682,49 @@ if ((Test-Path $OllamaExe) -and (Test-Path $LlamaServerExe)) {
 Write-Host ""
 Write-Host "[7/7] Importing AI models into the Ollama engine..." -ForegroundColor Yellow
 
-if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
+if (-Not (Test-OllamaRuntime)) {
     Write-Host "      ERROR: Ollama not found! Cannot import models." -ForegroundColor Red
     Write-Host "      Please re-run the installer to download Ollama." -ForegroundColor Red
     $downloadErrors += "Ollama Engine / model import"
 } else {
-    $env:OLLAMA_MODELS = "$USB_Drive\Shared\models\ollama_data"
+    $env:OLLAMA_MODELS = $OllamaDataDir
+    $env:OLLAMA_HOST = $PortableOllamaHost
+    # Never let the engine delete a model blob that is not registered yet
+    $env:OLLAMA_NOPRUNE = "1"
     New-Item -ItemType Directory -Force -Path $env:OLLAMA_MODELS | Out-Null
+    $logDir = "$USB_Drive\Shared\logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $ServerLog = "$logDir\ollama-install.log"
     Set-Location "$USB_Drive\Shared\models"
 
-    # Kill any dangling/unresponsive Ollama processes that cause hangs
+    # Kill any dangling portable engine left over from a previous run.
+    # A system-wide Ollama is left alone: we use our own port.
     Stop-Process -Name "ollama-windows" -Force -ErrorAction SilentlyContinue
-    Stop-Process -Name "ollama" -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 
     $modelsToImport = @()
     foreach ($m in $SelectedModels) {
         $ggufPath = "$USB_Drive\Shared\models\$($m.File)"
-        if (Test-Path $ggufPath) {
-            $modelsToImport += $m
-        } else {
-            Write-Host "      Skipping $($m.Name) - GGUF file not found (download may have failed)" -ForegroundColor Red
+        if (Test-ModelImported $m.Local) {
+            Write-Host "      $($m.Name) is already imported. Skipping..." -ForegroundColor Green
+        } elseif (-Not (Test-DownloadedFile -Path $ggufPath -MinSize $m.MinBytes)) {
+            Write-Host "      Skipping $($m.Name) - GGUF file missing or incomplete (download may have failed)" -ForegroundColor Red
             $downloadErrors += "$($m.Name) / model file missing"
+        } else {
+            $modelsToImport += $m
         }
     }
 
     if ($modelsToImport.Count -gt 0) {
         Write-Host "      Starting Ollama temporarily to perform import..." -ForegroundColor DarkGray
-        $ServerProcess = Start-Process -FilePath $OllamaExe -ArgumentList "serve" -WindowStyle Hidden -PassThru
+        $ServerProcess = Start-Process -FilePath $OllamaExe -ArgumentList "serve" -WindowStyle Hidden -PassThru -RedirectStandardError $ServerLog
 
         Write-Host "      Waiting for Ollama to be ready..." -ForegroundColor DarkGray
         $ready = $false
-        for ($i = 1; $i -le 60; $i++) {
+        for ($i = 1; $i -le 120; $i++) {
+            if ($ServerProcess.HasExited) { break }
             try {
-                $response = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 2
+                $response = Invoke-RestMethod -Uri "http://$PortableOllamaHost/api/tags" -TimeoutSec 2
                 if ($null -ne $response.models) {
                     $ready = $true
                     Write-Host "      Ollama is ready (took ${i}s)." -ForegroundColor Green
@@ -501,29 +735,38 @@ if (-Not (Test-Path "$USB_Drive\Shared\bin\ollama-windows.exe")) {
         }
 
         if (-Not $ready) {
-            Write-Host "      ERROR: Ollama did not become ready in 60 seconds. Skipping import." -ForegroundColor Red
-            $downloadErrors += "Ollama Engine / startup timeout"
+            Write-Host "      ERROR: Ollama engine did not start. Skipping import." -ForegroundColor Red
+            if (Test-Path $ServerLog) {
+                Write-Host "      Last lines of $ServerLog :" -ForegroundColor DarkGray
+                Get-Content $ServerLog -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkGray }
+            }
+            $downloadErrors += "Ollama Engine / startup failed"
         }
 
         if ($ready) {
             foreach ($m in $modelsToImport) {
-                Write-Host "      Importing $($m.Name)..." -ForegroundColor Yellow
-                Write-Host "      Running: ollama-windows.exe create $($m.Local) -f Modelfile-$($m.Local)" -ForegroundColor DarkGray
-                $createOutput = & $OllamaExe create $m.Local -f "Modelfile-$($m.Local)" 2>&1
+                Write-Host ""
+                Write-Host "      Importing $($m.Name) as '$($m.Local)'..." -ForegroundColor Yellow
+                Write-Host "      The file is checked once, then moved into the engine (no copy)." -ForegroundColor DarkGray
 
-                if ($LASTEXITCODE -eq 0) {
+                if (Import-ModelNoCopy -Model $m) {
                     Write-Host "      $($m.Name) imported successfully!" -ForegroundColor Green
                 } else {
-                    Write-Host "      ERROR: Failed to import $($m.Name) (exit $LASTEXITCODE)" -ForegroundColor Red
-                    Write-Host "      $createOutput" -ForegroundColor Red
+                    Write-Host "      ERROR: Failed to import $($m.Name)" -ForegroundColor Red
+                    Write-Host "      Engine log: $ServerLog" -ForegroundColor DarkGray
                     $downloadErrors += "$($m.Name) / import"
                 }
             }
         }
 
         Write-Host "      Stopping temporary Ollama server..." -ForegroundColor DarkGray
+        # /T also stops the llama-server runner started by the engine
+        if ($ServerProcess -and -Not $ServerProcess.HasExited) {
+            taskkill.exe /F /T /PID $ServerProcess.Id 2>$null | Out-Null
+        }
         Stop-Process -Name "ollama-windows" -Force -ErrorAction SilentlyContinue
-        Stop-Process -Name "ollama" -Force -ErrorAction SilentlyContinue
+    } elseif ($downloadErrors.Count -eq 0) {
+        Write-Host "      Nothing to import - all selected models are ready." -ForegroundColor Green
     } else {
         Write-Host "      ERROR: No models to import!" -ForegroundColor Red
         $downloadErrors += "Model import / no usable model file"

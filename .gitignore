@@ -20,3 +20,6 @@ Shared/logs/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Per-computer choice for the optional PC model cache
+Shared/config/pc-cache-*.txt

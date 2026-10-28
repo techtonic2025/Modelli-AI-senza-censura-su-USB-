@@ -20,7 +20,10 @@ import threading
 import webbrowser
 import time
 import platform
-import ctypes
+try:
+    import ctypes  # only used for hardware stats; broken Python installs can't load it
+except ImportError:
+    ctypes = None
 import logging
 import logging.handlers
 import queue
@@ -38,6 +41,12 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────
 CHAT_SERVER_PORT = 3333
 OLLAMA_HOST = "http://127.0.0.1:11434"
+# Launchers export OLLAMA_HOST (e.g. "127.0.0.1:11435" on Windows) for the engine
+_env_ollama_host = os.environ.get("OLLAMA_HOST", "").strip()
+if _env_ollama_host:
+    if "://" not in _env_ollama_host:
+        _env_ollama_host = "http://" + _env_ollama_host
+    OLLAMA_HOST = _env_ollama_host.replace("0.0.0.0", "127.0.0.1").rstrip("/")
 LLAMA_CPP_MODE = "--llama-cpp" in sys.argv
 if LLAMA_CPP_MODE:
     OLLAMA_HOST = "http://127.0.0.1:8080"

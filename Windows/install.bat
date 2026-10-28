@@ -19,7 +19,9 @@ echo.
 pause
 
 :: Run the PowerShell setup script from the same folder as this bat file
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-core.ps1"
+set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell1.0\powershell.exe"
+if not exist "%PS_EXE%" set "PS_EXE=powershell"
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-core.ps1"
 set "SETUP_EXIT=%ERRORLEVEL%"
 
 echo.
@@ -38,7 +40,7 @@ exit /b 0
 echo     SETUP DID NOT COMPLETE
 echo ===================================================
 echo.
-echo  One or more downloads or model imports failed.
+echo  Setup was cancelled, or a download / model import failed.
 echo  Do not start Fast Chat yet: it will not find a usable model.
 echo  Read the errors above, fix the connection or disk issue,
 echo  then run install.bat again. Completed downloads are skipped.

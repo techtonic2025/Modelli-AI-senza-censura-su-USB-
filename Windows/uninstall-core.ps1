@@ -187,6 +187,8 @@ function Remove-OllamaAliases {
     }
 
     $env:OLLAMA_MODELS = $OllamaDataDir
+    $env:OLLAMA_HOST = "127.0.0.1:11435"
+    $env:OLLAMA_NOPRUNE = "1"
     Stop-EngineProcesses
     Start-Sleep -Seconds 1
 
@@ -306,6 +308,8 @@ function Run-DownloadedDataCleanup {
     Remove-SafePath -Path (Join-Path $BinDir "llama-server-android") -Label "bin\\llama-server-android"
     Remove-SafePath -Path (Join-Path $BinDir "llama.cpp") -Label "bin\\llama.cpp"
     Remove-SafePath -Path (Join-Path $BinDir "temp_ollama") -Label "bin\\temp_ollama"
+    Remove-SafePath -Path (Join-Path $BinDir "lib") -Label "bin\\lib"
+    Remove-SafePath -Path (Join-Path $BinDir "ollama-windows-amd64.zip") -Label "bin\\ollama-windows-amd64.zip"
     Remove-SafePath -Path (Join-Path $SharedRoot "llama-server.log") -Label "llama-server.log"
     Remove-SafePath -Path (Join-Path $SharedRoot "__pycache__") -Label "__pycache__"
 

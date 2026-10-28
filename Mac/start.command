@@ -23,6 +23,11 @@ export OLLAMA_HOME="$OLLAMA_RUNTIME"
 export OLLAMA_TMPDIR="$OLLAMA_RUNTIME/tmp"
 export OLLAMA_ORIGINS="*"
 export OLLAMA_HOST="127.0.0.1:11434"
+# Speed/RAM: flash attention; keep the model loaded
+# for 30 min (reloading from a USB drive is slow); never prune model blobs
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KEEP_ALIVE=30m
+export OLLAMA_NOPRUNE=1
 mkdir -p "$OLLAMA_RUNTIME/tmp"
 # -------------------------------------------------------
 

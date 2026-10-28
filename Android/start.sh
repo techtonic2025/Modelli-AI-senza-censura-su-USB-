@@ -35,6 +35,14 @@ fi
 # Find the first .gguf file to load automatically
 MODEL_FILE=$(ls "$MODELS_DIR"/*.gguf 2>/dev/null | head -n 1)
 
+# Drives prepared on Windows keep models inside the engine store (no .gguf
+# copy): pick the smallest GGUF blob there, the best fit for a phone's RAM.
+if [ -z "$MODEL_FILE" ] && [ -d "$MODELS_DIR/ollama_data/blobs" ]; then
+    MODEL_FILE=$(find "$MODELS_DIR/ollama_data/blobs" -type f -size +50M 2>/dev/null | while read -r f; do
+        [ "$(head -c 4 "$f" 2>/dev/null)" = "GGUF" ] && echo "$(wc -c < "$f" | tr -d ' ') $f"
+    done | sort -n | head -n 1 | cut -d' ' -f2-)
+fi
+
 if [ -z "$MODEL_FILE" ]; then
     echo "ERROR: No .gguf models found in Shared/models/!"
     echo "Please download a model using install.sh first."

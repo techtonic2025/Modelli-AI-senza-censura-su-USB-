@@ -2307,6 +2307,19 @@
         );
       }
 
+      // Load the model into memory in the background as soon as it is
+      // selected, so the first answer doesn't wait for a slow USB read.
+      const preloadedModels = new Set();
+      function preloadModel(model) {
+        if (!model || model === 'local-llama-model' || preloadedModels.has(model)) return;
+        preloadedModels.add(model);
+        fetch(OLLAMA + '/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, keep_alive: '30m' }),
+        }).catch(() => preloadedModels.delete(model));
+      }
+
       function applyModel(model) {
         S.model = model;
         localStorage.setItem('g-model', model);
@@ -2314,6 +2327,7 @@
         $$('.mm-opt').forEach((opt) =>
           opt.classList.toggle('sel', opt.dataset.model === model),
         );
+        preloadModel(model);
         checkVisionWarn();
       }
 

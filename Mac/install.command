@@ -69,6 +69,17 @@ file_ok() {
 }
 
 # ----------------------------------------------------------------
+# Helper: model already registered in the shared engine store?
+# (The Windows installer moves the .gguf into the engine, so the
+#  .gguf may be gone while the model is fully usable.)
+# ----------------------------------------------------------------
+model_imported() {
+    local local_name=$1
+    [ -f "$OLLAMA_DATA/manifests-v2/ollama.com/library/$local_name/latest" ] ||
+    [ -f "$OLLAMA_DATA/manifests/registry.ollama.ai/library/$local_name/latest" ]
+}
+
+# ----------------------------------------------------------------
 # Helper: check file is a valid Mach-O binary (not an HTML page)
 # On Mac, Mach-O magic bytes: feedface / feedfacf / cffaedfe / cefaedfe
 # ----------------------------------------------------------------
@@ -319,6 +330,10 @@ download_model() {
     echo ""
     echo -e "  ${YLW}(${MODEL_INDEX}/${TOTAL_MODELS}) ${NAME} (~${SIZE} GB)${RST}"
 
+    if model_imported "$(get_field "$NUM" LOCAL)"; then
+        echo -e "${GRN}      Already installed in the AI engine! Skipping...${RST}"; return
+    fi
+
     if file_ok "$DEST" "$MINB"; then
         echo -e "${GRN}      Already downloaded! Skipping...${RST}"; return
     fi
@@ -363,7 +378,9 @@ if $HAS_CUSTOM && [ -n "$CUSTOM_URL" ]; then
     DEST="$MODELS_DIR/$CUSTOM_FILE"
     echo ""
     echo -e "  ${YLW}(${MODEL_INDEX}/${TOTAL_MODELS}) Custom: ${CUSTOM_FILE}${RST}"
-    if file_ok "$DEST" 100000000; then
+    if model_imported "$CUSTOM_LOCAL"; then
+        echo -e "${GRN}      Already installed in the AI engine! Skipping...${RST}"
+    elif file_ok "$DEST" 100000000; then
         echo -e "${GRN}      Already downloaded! Skipping...${RST}"
     else
         echo -e "${MAG}      Downloading custom model...${RST}"
@@ -541,18 +558,23 @@ else
     import_model() {
         local LOCAL=$1 NAME=$2 FILE=$3 MINB=$4
         local GGUF="$MODELS_DIR/$FILE"
+        if model_imported "$LOCAL"; then
+            echo -e "${GRN}      ${NAME} is already imported. Skipping...${RST}"
+            return
+        fi
         if ! file_ok "$GGUF" "$MINB"; then
             echo -e "${RED}      Skipping ${NAME} - GGUF file not found or incomplete${RST}"; return
         fi
         echo -e "${YLW}      Importing ${NAME}...${RST}"
         echo -e "${DGR}      Running: ollama-darwin create ${LOCAL} -f Modelfile-${LOCAL}${RST}"
-        CREATE_OUTPUT=$("$OLLAMA_BIN" create "$LOCAL" -f "Modelfile-${LOCAL}" 2>&1)
+        echo -e "${MAG}      Copying the model into the engine can take 10-30+ minutes on a USB drive.${RST}"
+        # Output is not captured so the progress bar stays visible
+        "$OLLAMA_BIN" create "$LOCAL" -f "Modelfile-${LOCAL}"
         CREATE_RC=$?
         if [ "$CREATE_RC" -eq 0 ]; then
             echo -e "${GRN}      ${NAME} imported successfully!${RST}"
         else
             echo -e "${RED}      ERROR: Failed to import ${NAME}${RST}"
-            echo "$CREATE_OUTPUT" | sed 's/^/        /'
             DOWNLOAD_ERRORS+=("Import: ${NAME}")
         fi
     }

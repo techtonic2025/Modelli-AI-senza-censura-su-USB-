@@ -135,6 +135,16 @@ Se vuoi usare l'AI pesante dal tuo telefono mentre sei sul divano:
 
 - **Lo script si chiude istantaneamente su Windows:** Probabilmente hai gli alias di esecuzione delle app Windows legacy attivi, che ingannano il sistema. Esegui lo script tramite un prompt dei comandi, o fai clic destro sul file `.bat` ed esegui "Come Amministratore".
 - **"Motore Ollama Non Trovato":** Hai tentato di eseguire lo script `start` prima che lo script `install` scaricasse il software di base per il tuo sistema operativo specifico. Esegui l'installer del tuo OS!
+- **Installazione interrotta:** Riesegui `install.bat`: modelli già installati vengono saltati e i download parziali ripartono da dove si erano fermati. Durante l'import viene mostrata una percentuale ("Checking model file..."): finché sale, sta lavorando.
+- **Dove finisce il file `.gguf`?** Su Windows il modello viene spostato (non copiato) dentro il motore, in `Shared/models/ollama_data`: occupa spazio una volta sola e l'import richiede pochi minuti. Mac, Linux e Android lo trovano lì automaticamente.
+- **"curl: (23) Failure writing output" / i modelli grandi non si scaricano:** La chiavetta è piena oppure è formattata **FAT32**, che non accetta file oltre 4 GB. Fai un backup e formattala in **exFAT** (o NTFS). Servono lo spazio dei modelli più ~5 GB per il motore.
+- **Errore "CRYPT_E_NO_REVOCATION_CHECK" scaricando Python:** Risolto negli script aggiornati: scarica di nuovo la cartella `Windows`.
+- **Hai già Ollama installato sul PC:** Nessun conflitto: la versione portatile su Windows usa la porta `11435`, quella di sistema resta sulla `11434`.
+- **Windows 7/8:** Non supportato. Il motore Ollama richiede Windows 10 o 11 a 64 bit.
+- **Il primo messaggio aspetta 30-60 secondi:** È il tempo per leggere il modello dalla chiavetta (il modello poi resta in memoria per 30 minuti). La chat inizia a caricarlo appena si apre la pagina, così l'attesa si sovrappone alla scrittura della domanda. Per accorciarla, mantenendo la portabilità e zero tracce sul PC:
+  - collega la chiavetta **direttamente a una porta USB 3** del PC (spesso blu o marcata "SS"), non a un hub o a una dock: un hub USB 2.0 limita la lettura a circa 40 MB/s;
+  - usa una chiavetta veloce o, meglio, un **SSD esterno USB**: il modello si carica in pochi secondi.
+- **Caricamento in ~1 secondo sul tuo PC (opzionale, solo Windows):** Esegui `Windows/enable-pc-cache.bat` su un **tuo** computer: al successivo avvio i modelli vengono copiati sul disco del PC e da lì si caricano quasi subito. È **disattivato di default** e va attivato PC per PC. ⚠️ **Privacy:** la copia resta su quel PC e chi lo usa può vedere quali modelli hai usato; le conversazioni invece restano solo sulla chiavetta. Non usarlo su PC condivisi o di lavoro. Per rimuovere la copia: `Windows/clear-pc-cache.bat`.
 - **Generazione Lenta:** Il tuo modello è troppo grande per la RAM del tuo PC host. Riesegui `install.bat` e seleziona il modello **Gemma 2 2B Abliterated**, che funziona rapidamente anche su macchine meno recenti.
 
 ---

@@ -25,7 +25,7 @@ foreach ($asset in $json.assets) {
     $dest = Join-Path $VendorDir $name
     Write-Host "      -> $name" -ForegroundColor DarkGray
     try {
-        curl.exe -L --ssl-no-revoke --silent --show-error $url -o $dest
+        curl.exe -L --fail --ssl-no-revoke --silent --show-error --connect-timeout 15 --max-time 120 $url -o $dest
         if (-Not (Test-Path $dest) -or (Get-Item $dest).Length -lt 1024) {
             throw "Downloaded file missing/too small"
         }
